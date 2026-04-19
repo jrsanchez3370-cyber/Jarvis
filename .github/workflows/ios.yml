@@ -1,1 +1,68 @@
+name: Build VisionClaw IPA
 
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Find and Prep Project
+        id: prep
+        run: |
+          XCODEPROJ_PATH=$(find . -name "*.xcodeproj" -print -quit)
+          PROJECT_DIR=$(dirname "$XCODEPROJ_PATH")
+          echo "dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+          
+          cd "$PROJECT_DIR"
+          # Install CocoaPods if they exist, essential to avoid code 65
+          if [ -f "Podfile" ]; then
+            pod install
+          fi
+
+      - name: Build Unsigned Archive
+        working-directory: ${{ steps.prep.outputs.dir }}
+        run: |
+          # 1. Determine Workspace or Project
+          if [ -d *.xcworkspace ]; then
+            FILE_FLAG="-workspace $(ls -d *.xcworkspace | head -n 1)"
+          else
+            FILE_FLAG="-project $(ls -d *.xcodeproj | head -n 1)"
+          fi
+          
+          # 2. Dynamically find the real scheme name to avoid hardcoding errors
+          SCHEME=$(xcodebuild -list -json | python3 -c "import sys, json; data = json.load(sys.stdin); print(data['project']['targets'][0] if 'project' in data else data['workspace']['targets'][0])")
+          
+          echo "Building Scheme: $SCHEME"
+          
+          # 3. The Archive command with Code 65 fixes
+          xcodebuild archive \
+            $FILE_FLAG \
+            -scheme "$SCHEME" \
+            -archivePath ./VisionClaw.xcarchive \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_FLAGS="--deep" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package IPA
+        run: |
+          # Locate the .app inside the archive and package it
+          APP_PATH=$(find . -name "*.app" -path "*/Applications/*" -print -quit)
+          mkdir -p Payload
+          cp -r "$APP_PATH" ./Payload/
+          zip -r VisionClaw.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: VisionClaw-IPA
+          path: VisionClaw.ipa
