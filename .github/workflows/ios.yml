@@ -1,1 +1,44 @@
+name: Build VisionClaw IPA
 
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Unsigned Archive
+        run: |
+          # Find the project file automatically
+          PROJECT=$(ls -d *.xcodeproj | head -n 1)
+          # Get the first target scheme
+          SCHEME=$(xcodebuild -list -project "$PROJECT" -json | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
+          
+          echo "Building Scheme: $SCHEME"
+          
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -archivePath ./build/VisionClaw.xcarchive \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_FLAGS="--deep"
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -r ./build/VisionClaw.xcarchive/Products/Applications/*.app ./Payload/
+          zip -r VisionClaw.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionClaw-IPA
+          path: VisionClaw.ipa
