@@ -1,1 +1,66 @@
+name: Build VisionClaw IPA
 
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Find and Prep Project
+        id: prep
+        run: |
+          XCODEPROJ_PATH=$(find . -name "*.xcodeproj" -print -quit)
+          PROJECT_DIR=$(dirname "$XCODEPROJ_PATH")
+          echo "dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+          
+          cd "$PROJECT_DIR"
+          if [ -f "Podfile" ]; then
+            pod install
+          fi
+
+      - name: Build Unsigned Archive
+        working-directory: ${{ steps.prep.outputs.dir }}
+        run: |
+          if [ -d *.xcworkspace ]; then
+            FILE_FLAG="-workspace $(ls -d *.xcworkspace | head -n 1)"
+          else
+            FILE_FLAG="-project $(ls -d *.xcodeproj | head -n 1)"
+          fi
+          
+          # Dynamic scheme detection
+          SCHEME=$(xcodebuild -list -json | python3 -c "import sys, json; data = json.load(sys.stdin); print(data['project']['targets'][0] if 'project' in data else data['workspace']['targets'][0])")
+          
+          echo "Building Scheme: $SCHEME"
+          
+          xcodebuild archive \
+            $FILE_FLAG \
+            -scheme "$SCHEME" \
+            -archivePath ./VisionClaw.xcarchive \
+            -sdk iphoneos \
+            -configuration Release \
+            ENABLE_PREVIEWS=NO \
+            SWIFT_COMPILATION_MODE=wholemodule \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_FLAGS="--deep" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find . -name "*.app" -path "*/Applications/*" -print -quit)
+          mkdir -p Payload
+          cp -r "$APP_PATH" ./Payload/
+          zip -r VisionClaw.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: VisionClaw-IPA
+          path: VisionClaw.ipa
