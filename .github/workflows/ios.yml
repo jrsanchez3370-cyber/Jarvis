@@ -1,1 +1,215 @@
+name: Build VisionClaw IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: 'Xcode Scheme'
+        required: false
+        default: 'VisionClaw'
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      CONFIGURATION: Release
+      ARCHIVE_PATH: './build/Release.xcarchive'
+      CODE_SIGNING_ALLOWED: 'NO'
+
+    steps:
+      # 1. Checkout Repository
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Verify Xcode Version
+      - name: Check Xcode Version
+        run: |
+          XCODE_VERSION=$(xcodebuild -version 2>&1)
+          echo "XCODE_VERSION=$XCODE_VERSION" >> $GITHUB_ENV
+          if [[ ! "$XCODE_VERSION" =~ [0-9]+\.[0-9] ]]; then
+            echo "::error::Could not detect Xcode version. Please verify macOS is updated."
+            exit 1
+          fi
+          echo "✅ Xcode is available: $XCODE_VERSION"
+
+      # 3. Find Project Location
+      - name: Detect and Validate Project Structure
+        id: project_detect
+        run: |
+          set -e
+          
+          # Get the current workspace directory (GitHub_WORKSPACE is the repo root)
+          REPO_ROOT="${GITHUB_WORKSPACE}"
+          echo "🔍 Checking repository root for Xcode projects..."
+          echo "REPO_ROOT=$REPO_ROOT" >> $GITHUB_OUTPUT
+
+          # Search for .xcodeproj or xcworkspace in REPO_ROOT and common subdirectories
+          PROJECT_FILE=""
+          
+          # Priority 1: Check current directory
+          if [ -f "${REPO_ROOT}/Podfile" ]; then
+            echo "✅ Podfile found at repository root!"
+            PROJECT_FILE="-project $(ls -d *.xcodeproj | head -n1)"
+          fi
+
+          # Priority 2: Search subdirectories for workspace
+          while IFS= read -r dir; do
+            if [ -f "${dir}/Podfile" ]; then
+              echo "✅ Podfile found in: ${dir}"
+              if [ -d "${dir}/*.xcworkspace" ]; then
+                WORKSPACE_FILE=$(ls "${dir}/*.xcworkspace" | head -n1)
+                PROJECT_FILE="-workspace $(dirname "$WORKSPACE_FILE")/$(basename $WORKSPACE_FILE)"
+                break
+              elif [ -d "${dir}/*.xcodeproj" ]; then
+                PROJECT_FILE="-project $(ls "${dir}/*.xcodeproj" | head -n1)"
+                break
+              fi
+            fi
+          done < <(find . -maxdepth 2 -type d -name "Pods" -prune -o -type f -name "Podfile" -print)
+
+          # Priority 3: Check immediate subdirectories of repo root
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "🔍 Checking subdirectories for project..."
+            if [ -d "${REPO_ROOT}/VisionClaw.xcodeproj" ]; then
+              PROJECT_FILE="-project ${REPO_ROOT}/VisionClaw.xcodeproj"
+              echo "✅ Found project file!"
+            elif [ -d "${REPO_ROOT}/VisionClaw.xcworkspace" ]; then
+              PROJECT_FILE="-workspace ${REPO_ROOT}/VisionClaw.xcworkspace"
+              echo "✅ Found workspace file!"
+            elif [ -d "${REPO_ROOT}/*.xcodeproj" ]; then
+              PROJECT_FILE="-project $(ls ${REPO_ROOT}/*.xcodeproj | head -n1)"
+              echo "✅ Found project file in root!"
+            fi
+          fi
+
+          # Validate we found a project
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "❌ Project file not found! Validating repository structure..."
+            ls -R "${REPO_ROOT}" || true
+            exit 1
+          else
+            echo "✅ Project file found: $PROJECT_FILE" >> $GITHUB_OUTPUT
+            echo "FOUND_PROJECT=$PROJECT_FILE" >> $GITHUB_OUTPUT
+          fi
+
+      # 4. Install CocoaPods Dependencies
+      - name: Setup and Install Pods
+        id: pods_setup
+        run: |
+          cd "${{ steps.project_detect.outputs.REPO_ROOT }}" || exit 1
+          
+          if [ ! -f "Podfile" ]; then
+            echo "⚠️ No Podfile found - proceeding without CocoaPods (use for static builds)"
+          elif [ ! -d "Pods" ]; then
+            echo "📦 Installing dependencies..."
+            pod install --verbose || exit 1
+          else
+            echo "✅ Pods already installed."
+          fi
+
+      # 5. Build xcarchive
+      - name: Build Unsigned xcarchive
+        run: |
+          set -e
+          
+          REPO_ROOT="${{ steps.project_detect.outputs.REPO_ROOT }}"
+          PROJECT_FILE="${{ steps.project_detect.outputs.FOUND_PROJECT }}"
+          
+          cd "$REPO_ROOT" || exit 1
+          
+          SCHEME=${{ github.event.inputs.scheme }}
+          OUTPUT_ARCHIVE="$ARCHIVE_PATH"
+          
+          echo "🔧 Building scheme: $SCHEME"
+          echo "📁 Project: $PROJECT_FILE"
+          
+          # Build with correct Xcodebuild flags for IPA generation
+          xcodebuild archive \
+            $PROJECT_FILE \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -archivePath "$(dirname $OUTPUT_ARCHIVE)" \
+            -destination='platform=iOS Simulator,name=iPhone 15 Pro' \
+            ONLY_ACTIVE_ARCH=NO \
+            SWIFT_COMPILATION_MODE=wholemodule \
+            CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            ENABLE_PREVIEWS=NO \
+            clean \
+            archive || {
+              echo "❌ Archive build failed!"
+              exit 1
+            }
+
+          # Verify archive was created
+          if [ ! -d "$OUTPUT_ARCHIVE" ]; then
+            echo "::error::Archive not found at: $OUTPUT_ARCHIVE"
+            exit 1
+          fi
+
+          echo "✅ Archive created successfully at: $ARCHIVE_PATH"
+
+      # 6. Extract App Bundle for IPA
+      - name: Prepare App Bundle for IPA
+        run: |
+          set -e
+          
+          APP_DIR="$ARCHIVE_PATH/Products/Applications/"
+          APP_BUNDLE=$(ls "$APP_DIR"/*.app 2>/dev/null || ls "$APP_DIR"/*.app)
+
+          if [ -z "$APP_BUNDLE" ]; then
+            echo "❌ App bundle not found at: $APP_DIR"
+            echo "Available files in archive:"
+            ls -R "$ARCHIVE_PATH"
+            exit 1
+          fi
+
+          echo "✅ Extracting app bundle: $(basename "$APP_BUNDLE")"
+
+          # Create Payload folder with correct structure for IPA
+          mkdir -p Payload
+          
+          # Copy the extracted .app file to Payload
+          cp -r "$APP_BUNDLE" ./Payload/$(basename $APP_BUNDLE) || true
+
+      # 7. Create Final IPA Package
+      - name: Package IPA File
+        run: |
+          set -e
+          
+          cd "${GITHUB_WORKSPACE}"
+          
+          if [ ! -d "Payload" ]; then
+            echo "::error::Payload directory not found!"
+            exit 1
+          fi
+
+          # Create the IPA zip file
+          zip -r9 VisionClaw.ipa Payload/$(basename $APP_BUNDLE) || {
+            echo "❌ Failed to create IPA!"
+            ls -R ./Payload/
+            exit 1
+          }
+
+          if [ ! -f "VisionClaw.ipa" ]; then
+            echo "::error::IPA file was not created!"
+            exit 1
+          fi
+
+          # Get and display final size
+          IPA_SIZE=$(du -h VisionClaw.ipa | awk '{print $1}')
+          echo "✅ Final IPA size: ${IPA_SIZE}" >> $GITHUB_OUTPUT
+
+      # 8. Upload Artifact
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionClaw-IPA
+          path: |
+            VisionClaw.ipa
+          if-no-files-found: error
+          retention-days: 30
 
