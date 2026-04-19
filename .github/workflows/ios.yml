@@ -1,1 +1,66 @@
+name: Build VisionClaw IPA
 
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Find and Prep Project
+        id: prep
+        run: |
+          XCODEPROJ_PATH=$(find . -name "*.xcodeproj" -print -quit)
+          PROJECT_DIR=$(dirname "$XCODEPROJ_PATH")
+          echo "Found project at: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+          
+          cd "$PROJECT_DIR"
+          # Install pods if they exist
+          if [ -f "Podfile" ]; then
+            pod install
+          fi
+
+      - name: Build Unsigned Archive
+        working-directory: ${{ steps.prep.outputs.dir }}
+        run: |
+          # Detect Workspace or Project
+          if [ -d *.xcworkspace ]; then
+            FILE_FLAG="-workspace $(ls -d *.xcworkspace | head -n 1)"
+          else
+            FILE_FLAG="-project $(ls -d *.xcodeproj | head -n 1)"
+          fi
+          
+          # We are manually setting the scheme to 'VisionClaw' to avoid the JSON error
+          SCHEME="VisionClaw"
+          
+          echo "Building Scheme: $SCHEME"
+          
+          xcodebuild archive \
+            $FILE_FLAG \
+            -scheme "$SCHEME" \
+            -archivePath ./VisionClaw.xcarchive \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_FLAGS="--deep"
+
+      - name: Package IPA
+        run: |
+          # Locate the .app inside the newly created archive
+          APP_PATH=$(find . -name "*.app" -path "*/Applications/*" -print -quit)
+          mkdir -p Payload
+          cp -r "$APP_PATH" ./Payload/
+          zip -r VisionClaw.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: VisionClaw-IPA
+          path: VisionClaw.ipa
